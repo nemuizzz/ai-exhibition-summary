@@ -148,6 +148,7 @@
     const CHUNK_MS = 3000;
     let lastFlush = 0;
     let useRealtimeDC = false;
+    let rtc = null; // { pc, dc, stream }
     let liveLineEl = null;
     let lastCommitted = '';
 
@@ -341,18 +342,11 @@
         });
         const answer = { type: 'answer', sdp: await sdpResp.text() };
         await pc.setRemoteDescription(answer);
-        return { pc, dc };
+        return { pc, dc, stream };
       }
 
-      const rt = await connectRealtime();
-      if (rt) { log('Realtime接続'); useRealtimeDC = true; }
-      // 録音開始時にサーバーへRealtime上流接続を要求（必要時のみ）
-      try {
-        if (ws?.readyState !== 1) await new Promise(r => ws.onopen = r);
-        const header = JSON.stringify({ type: 'realtime_open' });
-        const enc = new TextEncoder().encode(header + '\n');
-        ws.send(enc);
-      } catch (_) { }
+      rtc = await connectRealtime();
+      if (rtc) { log('Realtime接続'); useRealtimeDC = true; }
 
       // 既存のWS経路は残す（要約UI維持用）
       ws = new WebSocket(location.origin.replace('http', 'ws') + '/stream');
@@ -366,6 +360,13 @@
         } catch (_) { }
       };
       await new Promise(r => ws.onopen = r);
+
+      // 録音開始時にサーバーへRealtime上流接続を要求
+      try {
+        const header = JSON.stringify({ type: 'realtime_open' });
+        const enc = new TextEncoder().encode(header + '\n');
+        ws.send(enc);
+      } catch (_) { }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
@@ -411,6 +412,22 @@
         if (audioCtx) await audioCtx.close();
         // 停止時は追加転送しない（料金節約のため録音中のみWhisper利用）
       } finally {
+        // Realtime上流とWebRTCを確実に停止
+        try {
+          if (ws?.readyState === 1) {
+            const header = JSON.stringify({ type: 'realtime_close' });
+            const enc = new TextEncoder().encode(header + '\n');
+            ws.send(enc);
+          }
+        } catch (_) { }
+        try {
+          if (rtc?.dc) rtc.dc.close();
+          if (rtc?.pc) rtc.pc.getSenders().forEach(s => { try { s.track && s.track.stop(); } catch (_) { } });
+          if (rtc?.pc) rtc.pc.close();
+          if (rtc?.stream) rtc.stream.getTracks().forEach(t => { try { t.stop(); } catch (_) { } });
+        } catch (_) { }
+        rtc = null; useRealtimeDC = false;
+
         ws?.close(); log('停止');
         allParts = [];
         chunkSamples = [];
