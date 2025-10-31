@@ -346,6 +346,13 @@
 
       const rt = await connectRealtime();
       if (rt) { log('Realtime接続'); useRealtimeDC = true; }
+      // 録音開始時にサーバーへRealtime上流接続を要求（必要時のみ）
+      try {
+        if (ws?.readyState !== 1) await new Promise(r => ws.onopen = r);
+        const header = JSON.stringify({ type: 'realtime_open' });
+        const enc = new TextEncoder().encode(header + '\n');
+        ws.send(enc);
+      } catch (_) { }
 
       // 既存のWS経路は残す（要約UI維持用）
       ws = new WebSocket(location.origin.replace('http', 'ws') + '/stream');
@@ -380,15 +387,15 @@
         const now = performance.now();
         if (now - lastFlush >= CHUNK_MS && ws.readyState === 1) {
           lastFlush = now;
-          // 小さなPCM16(24kHz)を送信
+          // 小さなWAV(24kHz/mono/16bit)を送信（録音中のみWhisper使用）
           const i16 = Int16Array.from(chunkSamples);
           const i16_24k = resampleInt16(i16, sampleRate, 24000);
+          const wavBytes = encodeWAV(i16_24k, 24000);
           chunkSamples = [];
-          const pcmBytes = new Uint8Array(i16_24k.buffer);
-          const header = JSON.stringify({ seq: Math.floor(now), ts: Date.now(), type: 'pcm16_chunk', mime: 'audio/pcm', sr: 24000 });
+          const header = JSON.stringify({ seq: Math.floor(now), ts: Date.now(), type: 'wav_chunk', mime: 'audio/wav', sr: 24000 });
           const enc = new TextEncoder().encode(header + '\n');
-          const merged = new Uint8Array(enc.length + pcmBytes.byteLength);
-          merged.set(enc, 0); merged.set(pcmBytes, enc.length);
+          const merged = new Uint8Array(enc.length + wavBytes.byteLength);
+          merged.set(enc, 0); merged.set(wavBytes, enc.length);
           ws.send(merged);
         }
       };
@@ -402,18 +409,7 @@
         if (processor) { processor.disconnect(); processor.onaudioprocess = null; }
         if (source) source.disconnect();
         if (audioCtx) await audioCtx.close();
-        // 停止時、全量PCM16(24kHz)をfinalとして送信
-        if (allSamples.length && ws?.readyState === 1) {
-          const i16 = Int16Array.from(allSamples);
-          const i16_24k = resampleInt16(i16, sampleRate, 24000);
-          const pcmBytes = new Uint8Array(i16_24k.buffer);
-          const header = JSON.stringify({ type: 'final_pcm16', ts: Date.now(), mime: 'audio/pcm', sr: 24000 });
-          const enc = new TextEncoder().encode(header + '\n');
-          const merged = new Uint8Array(enc.length + pcmBytes.byteLength);
-          merged.set(enc, 0); merged.set(pcmBytes, enc.length);
-          ws.send(merged);
-          await new Promise(r => setTimeout(r, 400));
-        }
+        // 停止時は追加転送しない（料金節約のため録音中のみWhisper利用）
       } finally {
         ws?.close(); log('停止');
         allParts = [];
@@ -425,6 +421,15 @@
           document.getElementById('summaries').innerHTML = '';
           liveLineEl = null;
           lastCommitted = '';
+        } catch (_) { }
+        // 録音停止時はRealtime上流を閉じる
+        try {
+          const w = new WebSocket(location.origin.replace('http', 'ws') + '/stream');
+          await new Promise(r => w.onopen = r);
+          const header = JSON.stringify({ type: 'realtime_close' });
+          const enc = new TextEncoder().encode(header + '\n');
+          w.send(enc);
+          w.close();
         } catch (_) { }
       }
       document.getElementById('start').disabled = false;

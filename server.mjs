@@ -123,77 +123,67 @@ wss.on('connection', (socket) => {
     }
   }, SUMMARY_INTERVAL_MS);
 
-  // OpenAI Realtime Transcriptionセッション（上流WS）
+  // OpenAI Realtime（遅延接続：録音開始時のみ）
   const rtModel = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview';
   const transcribeModel = process.env.TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe';
-  const rt = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(rtModel)}`,
-    'realtime',
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
-      },
-      perMessageDeflate: false
-    }
-  );
-
-  const sendRT = (obj) => {
-    if (rt.readyState === 1) rt.send(JSON.stringify(obj));
-  };
-
-  rt.on('open', () => {
-    // 文字起こしセッション設定
-    sendRT({
-      type: 'transcription_session.update',
-      input_audio_format: 'pcm16',
-      input_audio_transcription: {
-        model: transcribeModel,
-        prompt: '日本語中心の会話。人名・社名・製品名を正確に。',
-        language: 'ja'
-      },
-      turn_detection: {
-        type: 'server_vad',
-        threshold: 0.5,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 700
-      },
-      input_audio_noise_reduction: { type: 'near_field' },
-      include: []
+  let rt = null;
+  const sendRT = (obj) => { if (rt && rt.readyState === 1) rt.send(JSON.stringify(obj)); };
+  const openRealtime = () => {
+    if (rt && (rt.readyState === 0 || rt.readyState === 1)) return; // connecting/open
+    rt = new WebSocket(
+      `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(rtModel)}`,
+      'realtime',
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'realtime=v1'
+        },
+        perMessageDeflate: false
+      }
+    );
+    rt.on('open', () => {
+      sendRT({
+        type: 'transcription_session.update',
+        input_audio_format: 'pcm16',
+        input_audio_transcription: {
+          model: transcribeModel,
+          prompt: '日本語中心の会話。人名・社名・製品名を正確に。',
+          language: 'ja'
+        },
+        turn_detection: {
+          type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 700
+        },
+        input_audio_noise_reduction: { type: 'near_field' },
+        include: []
+      });
     });
-  });
-
-  rt.on('message', async (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      const t = msg.type;
-      if (t === 'conversation.item.input_audio_transcription.delta') {
-        const delta = msg.delta || '';
-        if (delta) {
-          liveAccumulated = delta; // ライブ行として保持
-          socket.send(JSON.stringify({ type: 'transcript_delta', text: delta }));
+    rt.on('message', async (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        const t = msg.type;
+        if (t === 'conversation.item.input_audio_transcription.delta') {
+          const delta = msg.delta || '';
+          if (delta) { liveAccumulated = delta; socket.send(JSON.stringify({ type: 'transcript_delta', text: delta })); }
         }
-      }
-      if (t === 'conversation.item.input_audio_transcription.completed') {
-        const transcript = msg.transcript || '';
-        if (transcript) {
-          socket.send(JSON.stringify({ type: 'transcript', text: transcript }));
-          bufferText += (bufferText ? ' ' : '') + transcript;
-          totalTranscript += (totalTranscript ? ' ' : '') + transcript;
-          liveAccumulated = '';
+        if (t === 'conversation.item.input_audio_transcription.completed') {
+          const transcript = msg.transcript || '';
+          if (transcript) {
+            socket.send(JSON.stringify({ type: 'transcript', text: transcript }));
+            bufferText += (bufferText ? ' ' : '') + transcript;
+            totalTranscript += (totalTranscript ? ' ' : '') + transcript;
+            liveAccumulated = '';
+          }
         }
-      }
-    } catch (_) { }
-  });
-
-  rt.on('error', (e) => console.error('RT error', e.message || e));
-  rt.on('unexpected-response', (req, res) => {
-    console.error('RT unexpected-response status', res.statusCode);
-    res.on('data', (d) => process.stderr.write(String(d)));
-  });
-  rt.on('close', (code, reason) => {
-    console.log('RT closed', code, reason?.toString?.());
-  });
+      } catch (_) { }
+    });
+    rt.on('error', (e) => console.error('RT error', e.message || e));
+    rt.on('unexpected-response', (req, res) => {
+      console.error('RT unexpected-response status', res.statusCode);
+      res.on('data', (d) => process.stderr.write(String(d)));
+    });
+    rt.on('close', (code, reason) => { console.log('RT closed', code, reason?.toString?.()); });
+  };
+  const closeRealtime = () => { try { rt?.close(); } catch (_) { } rt = null; };
 
   socket.on('message', async (data) => {
     // 先頭行(JSON) + '\n' + 本体
@@ -202,6 +192,9 @@ wss.on('connection', (socket) => {
     if (nl < 0) return;
     const header = JSON.parse(new TextDecoder().decode(u8.slice(0, nl)));
     const body = u8.slice(nl + 1);
+    // Realtimeの遅延接続制御
+    if (header.type === 'realtime_open') { openRealtime(); return; }
+    if (header.type === 'realtime_close') { closeRealtime(); return; }
     // フロントからの確定文字起こしをサーバーに反映
     if (header.type === 'transcript_push' && header.text) {
       const text = String(header.text).trim();
@@ -505,6 +498,7 @@ const httpServer = http.createServer(async (req, res) => {
         })
       });
       const json = await resp.json();
+      console.log('[session] status', resp.status);
       res.statusCode = resp.ok ? 200 : 400;
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify(json));
