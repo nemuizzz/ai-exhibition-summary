@@ -1,0 +1,434 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+
+<style>
+  :root {
+    color-scheme: light dark;
+  }
+
+  body {
+    margin: 0;
+    padding: calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 88px) 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+    line-height: 1.4;
+    background: #0b0c10;
+    color: #e8eaed;
+  }
+
+  header {
+    font-weight: 700;
+    font-size: 18px;
+    margin-bottom: 12px;
+  }
+
+  .pill {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #1f2937;
+    color: #cbd5e1;
+    font-size: 12px;
+    margin-left: 8px;
+  }
+
+  .section {
+    margin: 12px 0;
+    padding: 12px;
+    background: #111827;
+    border-radius: 12px;
+    border: 1px solid #1f2937;
+  }
+
+  #transcript {
+    max-height: 30vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-size: 15px;
+  }
+
+  #summaries {
+    display: grid;
+    gap: 12px;
+  }
+
+  .card {
+    background: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 12px;
+    padding: 12px;
+  }
+
+  .card h3 {
+    margin: 0 0 6px 0;
+    font-size: 16px;
+  }
+
+  .card small {
+    color: #9ca3af;
+  }
+
+  .actions,
+  .decisions {
+    margin: 8px 0 0 0;
+    padding-left: 16px;
+  }
+
+  .controls {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 12px 16px calc(env(safe-area-inset-bottom) + 12px) 16px;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(10px);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  button {
+    -webkit-tap-highlight-color: transparent;
+    height: 56px;
+    font-size: 17px;
+    font-weight: 600;
+    border-radius: 12px;
+    border: 1px solid #334155;
+    color: #e5e7eb;
+    background: linear-gradient(180deg, #1f2937, #111827);
+  }
+
+  #start {
+    border-color: #16a34a;
+    background: linear-gradient(180deg, #22c55e, #15803d);
+  }
+
+  #stop {
+    border-color: #dc2626;
+    background: linear-gradient(180deg, #ef4444, #991b1b);
+  }
+
+  button:disabled {
+    opacity: 0.5;
+  }
+
+  #log {
+    display: none;
+  }
+</style>
+
+<body>
+  <header>
+    RT Sum <span class="pill">beta</span>
+  </header>
+
+  <div class="section">
+    <div style="font-weight:600;margin-bottom:8px;">ライブ文字起こし</div>
+    <div id="transcript"></div>
+  </div>
+
+  <div class="section">
+    <div style="font-weight:600;margin-bottom:8px;">要約</div>
+    <div id="summaries"></div>
+  </div>
+
+  <div class="controls">
+    <button id="start">🎙️ 録音開始</button>
+    <button id="stop" disabled>■ 停止</button>
+  </div>
+  <pre id="log"></pre>
+  <script>
+    const log = (m) => document.getElementById('log').textContent += m + '\n';
+
+    let ws, rec;
+    let allParts = [];
+    let audioCtx, processor, source;
+    let chunkSamples = [];
+    let allSamples = [];
+    let sampleRate = 48000;
+    const CHUNK_MS = 3000;
+    let lastFlush = 0;
+    let useRealtimeDC = false;
+    let liveLineEl = null;
+    let lastCommitted = '';
+
+    function floatTo16BitPCM(float32Array) {
+      const out = new Int16Array(float32Array.length);
+      for (let i = 0; i < float32Array.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    }
+
+    function encodeWAV(int16Data, sr) {
+      const numChannels = 1;
+      const bytesPerSample = 2;
+      const blockAlign = numChannels * bytesPerSample;
+      const byteRate = sr * blockAlign;
+      const dataSize = int16Data.length * bytesPerSample;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+      // RIFF header
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true);
+      writeString(view, 8, 'WAVE');
+      // fmt chunk
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true); // PCM chunk size
+      view.setUint16(20, 1, true);  // PCM format
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sr, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, 16, true); // bits per sample
+      // data chunk
+      writeString(view, 36, 'data');
+      view.setUint32(40, dataSize, true);
+      // PCM samples
+      let offset = 44;
+      for (let i = 0; i < int16Data.length; i++, offset += 2) {
+        view.setInt16(offset, int16Data[i], true);
+      }
+      return new Uint8Array(buffer);
+    }
+
+    function writeString(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+
+    function resampleInt16(int16Data, inRate, outRate = 16000) {
+      if (inRate === outRate) return int16Data;
+      const ratio = inRate / outRate;
+      const outLength = Math.max(1, Math.floor(int16Data.length / ratio));
+      const out = new Int16Array(outLength);
+      for (let i = 0; i < outLength; i++) {
+        const idxFloat = i * ratio;
+        const idx = Math.floor(idxFloat);
+        const frac = idxFloat - idx;
+        const s0 = int16Data[idx] ?? 0;
+        const s1 = int16Data[Math.min(idx + 1, int16Data.length - 1)] ?? 0;
+        const s = s0 + (s1 - s0) * frac;
+        out[i] = Math.max(-32768, Math.min(32767, Math.round(s)));
+      }
+      return out;
+    }
+    const transcriptEl = document.getElementById('transcript');
+    const summariesEl = document.getElementById('summaries');
+
+    function trimTranscript() {
+      while (transcriptEl.children.length > 10) transcriptEl.removeChild(transcriptEl.firstChild);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    function appendTranscript(text) {
+      const p = document.createElement('div');
+      p.textContent = text;
+      transcriptEl.appendChild(p);
+      trimTranscript();
+    }
+
+    function updateLiveTranscript(text) {
+      if (!liveLineEl) {
+        liveLineEl = document.createElement('div');
+        liveLineEl.style.opacity = '0.7';
+        transcriptEl.appendChild(liveLineEl);
+      }
+      liveLineEl.textContent = text;
+      trimTranscript();
+    }
+
+    function commitTranscript(text) {
+      if (text && text.trim() && text.trim() !== lastCommitted.trim()) {
+        appendTranscript(text.trim());
+        lastCommitted = text.trim();
+      }
+      if (liveLineEl) {
+        liveLineEl.remove();
+        liveLineEl = null;
+      }
+      trimTranscript();
+    }
+
+    function handleTranscriptEvent(type, text) {
+      if (!text) return;
+      if (type === 'transcript_delta') updateLiveTranscript(text);
+      if (type === 'transcript') commitTranscript(text);
+    }
+
+    function addSummaryCard(data) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const ts = data.timestamp || new Date().toISOString();
+      // 新スキーマ
+      const rows = [
+        ['来場目的', data['来場目的'] || ''],
+        ['業務の課題', data['業務の課題'] || ''],
+        ['検討サービス', Array.isArray(data['検討サービス']) ? data['検討サービス'].join('、') : (data['検討サービス'] || '')],
+        ['導入予定時期', data['導入予定時期'] || ''],
+        ['予算確保の状況', data['予算確保の状況'] || ''],
+        ['予算額', data['予算額'] || ''],
+        ['具体的に依頼したい内容', data['具体的に依頼したい内容'] || ''],
+        ['その他', data['その他'] || '']
+      ];
+      const body = rows
+        .filter(([_, v]) => v !== '')
+        .map(([k, v]) => `<div style="margin:6px 0;"><div style=\"color:#9ca3af;font-size:12px\">${k}</div><div style=\"white-space:pre-wrap\">${v}</div></div>`)
+        .join('');
+      // 旧スキーマ（後方互換）
+      const legacy = (() => {
+        const topic = data.topic || '';
+        const summary = data.summary || '';
+        const decisions = Array.isArray(data.decisions) ? data.decisions : [];
+        const actions = Array.isArray(data.actions) ? data.actions : [];
+        if (!topic && !summary && decisions.length === 0 && actions.length === 0) return '';
+        return `
+          ${topic ? `<div style=\"margin:6px 0;\"><div style=\"color:#9ca3af;font-size:12px\">トピック</div><div style=\"white-space:pre-wrap\">${topic}</div></div>` : ''}
+          ${summary ? `<div style=\"margin:6px 0;\"><div style=\"color:#9ca3af;font-size:12px\">要約</div><div style=\"white-space:pre-wrap\">${summary}</div></div>` : ''}
+        `;
+      })();
+      card.innerHTML = `
+        <h3>要約 <small>${ts}</small></h3>
+        ${body || legacy || '<div style="color:#9ca3af">内容なし</div>'}
+      `;
+      // 最新を上に追加（過去は保持）
+      summariesEl.prepend(card);
+    }
+    document.getElementById('start').onclick = async () => {
+      // WebRTC (Realtime) 接続
+      async function connectRealtime() {
+        const sess = await fetch('/session', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+        const sjson = await sess.json();
+        if (!sjson?.client_secret?.value) { alert('Realtimeセッション作成に失敗'); return null; }
+        const token = sjson.client_secret.value;
+
+        const pc = new RTCPeerConnection();
+        const dc = pc.createDataChannel('oai-events');
+        dc.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg?.type === 'conversation.item.input_audio_transcription.delta' && msg.delta) {
+              handleTranscriptEvent('transcript_delta', msg.delta);
+            }
+            if (msg?.type === 'conversation.item.input_audio_transcription.completed' && msg.transcript) {
+              handleTranscriptEvent('transcript', msg.transcript);
+              // サーバーへ確定文を送って要約用バッファに反映
+              try {
+                if (ws?.readyState === 1) {
+                  const header = JSON.stringify({ type: 'transcript_push', text: msg.transcript });
+                  const enc = new TextEncoder().encode(header + '\n');
+                  ws.send(enc);
+                }
+              } catch (_) { }
+            }
+          } catch (_) { }
+        };
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        for (const track of stream.getAudioTracks()) pc.addTrack(track, stream);
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const sdpResp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(sjson.model || 'gpt-4o-realtime-preview')}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/sdp',
+            'OpenAI-Beta': 'realtime=v1'
+          },
+          body: offer.sdp
+        });
+        const answer = { type: 'answer', sdp: await sdpResp.text() };
+        await pc.setRemoteDescription(answer);
+        return { pc, dc };
+      }
+
+      const rt = await connectRealtime();
+      if (rt) { log('Realtime接続'); useRealtimeDC = true; }
+
+      // 既存のWS経路は残す（要約UI維持用）
+      ws = new WebSocket(location.origin.replace('http', 'ws') + '/stream');
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(typeof ev.data === 'string' ? ev.data : '');
+          if (!useRealtimeDC && msg?.type === 'transcript' && msg.text) handleTranscriptEvent('transcript', msg.text);
+          if (!useRealtimeDC && msg?.type === 'transcript_delta' && msg.text) handleTranscriptEvent('transcript_delta', msg.text);
+          if (msg?.type === 'summary' && msg.data) addSummaryCard(msg.data);
+          if (msg?.type === 'summary_raw' && msg.data) addSummaryCard({ summary: msg.data });
+        } catch (_) { }
+      };
+      await new Promise(r => ws.onopen = r);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      // Web AudioでPCM収集（1ch）
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+      sampleRate = audioCtx.sampleRate;
+      source = audioCtx.createMediaStreamSource(stream);
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      lastFlush = performance.now();
+      processor.onaudioprocess = (ev) => {
+        const ch0 = ev.inputBuffer.getChannelData(0);
+        const i16 = floatTo16BitPCM(ch0);
+        // 蓄積
+        chunkSamples.push(...i16);
+        allSamples.push(...i16);
+        const now = performance.now();
+        if (now - lastFlush >= CHUNK_MS && ws.readyState === 1) {
+          lastFlush = now;
+          // 小さなPCM16(24kHz)を送信
+          const i16 = Int16Array.from(chunkSamples);
+          const i16_24k = resampleInt16(i16, sampleRate, 24000);
+          chunkSamples = [];
+          const pcmBytes = new Uint8Array(i16_24k.buffer);
+          const header = JSON.stringify({ seq: Math.floor(now), ts: Date.now(), type: 'pcm16_chunk', mime: 'audio/pcm', sr: 24000 });
+          const enc = new TextEncoder().encode(header + '\n');
+          const merged = new Uint8Array(enc.length + pcmBytes.byteLength);
+          merged.set(enc, 0); merged.set(pcmBytes, enc.length);
+          ws.send(merged);
+        }
+      };
+      log('録音開始');
+      document.getElementById('start').disabled = true;
+      document.getElementById('stop').disabled = false;
+    };
+
+    document.getElementById('stop').onclick = async () => {
+      try {
+        if (processor) { processor.disconnect(); processor.onaudioprocess = null; }
+        if (source) source.disconnect();
+        if (audioCtx) await audioCtx.close();
+        // 停止時、全量PCM16(24kHz)をfinalとして送信
+        if (allSamples.length && ws?.readyState === 1) {
+          const i16 = Int16Array.from(allSamples);
+          const i16_24k = resampleInt16(i16, sampleRate, 24000);
+          const pcmBytes = new Uint8Array(i16_24k.buffer);
+          const header = JSON.stringify({ type: 'final_pcm16', ts: Date.now(), mime: 'audio/pcm', sr: 24000 });
+          const enc = new TextEncoder().encode(header + '\n');
+          const merged = new Uint8Array(enc.length + pcmBytes.byteLength);
+          merged.set(enc, 0); merged.set(pcmBytes, enc.length);
+          ws.send(merged);
+          await new Promise(r => setTimeout(r, 400));
+        }
+      } finally {
+        ws?.close(); log('停止');
+        allParts = [];
+        chunkSamples = [];
+        allSamples = [];
+        // 停止時にUIをリセット
+        try {
+          document.getElementById('transcript').innerHTML = '';
+          document.getElementById('summaries').innerHTML = '';
+          liveLineEl = null;
+          lastCommitted = '';
+        } catch (_) { }
+      }
+      document.getElementById('start').disabled = false;
+      document.getElementById('stop').disabled = true;
+    };
+  </script>
+</body>
